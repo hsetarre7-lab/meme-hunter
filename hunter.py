@@ -29,6 +29,7 @@ import math
 import os
 import re
 import statistics
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -46,7 +47,7 @@ MIN_VOL24 = float(os.getenv("MIN_VOL24", "10000"))
 MIN_FDV = float(os.getenv("MIN_FDV", "50000"))
 MAX_FDV = float(os.getenv("MAX_FDV", "10000000"))
 MAX_AGE_H = float(os.getenv("MAX_AGE_H", "720"))
-GECKO_TOP_PAGES = int(os.getenv("GECKO_TOP_PAGES", "10"))
+GECKO_TOP_PAGES = int(os.getenv("GECKO_TOP_PAGES", "3"))
 MAX_H1_PCT = float(os.getenv("MAX_H1_PCT", "55"))
 MAX_H24_PCT = float(os.getenv("MAX_H24_PCT", "350"))
 MIN_LIQ_MCAP = float(os.getenv("MIN_LIQ_MCAP", "0.035"))
@@ -69,6 +70,10 @@ GMGN_KEY = os.getenv("GMGN_API_KEY", "")
 GMGN_ENRICH_LIMIT = int(os.getenv("GMGN_ENRICH_LIMIT", "12"))
 GMGN_WALLET_LIMIT = int(os.getenv("GMGN_WALLET_LIMIT", "2"))
 RUGCHECK_LIMIT = int(os.getenv("RUGCHECK_LIMIT", "20"))
+RUGCHECK_API_KEY = os.getenv("RUGCHECK_API_KEY", "")
+GMGN_CLI = os.getenv("GMGN_CLI", "gmgn-cli")
+GMGN_SMART_LIMIT = int(os.getenv("GMGN_SMART_LIMIT", "200"))
+GMGN_KOL_LIMIT = int(os.getenv("GMGN_KOL_LIMIT", "100"))
 
 # State
 STATE_DIR = os.getenv("STATE_DIR", "state")
@@ -346,6 +351,8 @@ def blank_candidate(net, token, symbol="?"):
         "honeypot": False,
         "security_notes": [],
         "gmgn": False,
+        "gmgn_security": False,
+        "security_complete": False,
         "rugcheck": False,
         "helius": False,
         "sec_drop": False,
@@ -427,7 +434,7 @@ def discover_gecko(cands):
                     merge_candidate(cands[key], c)
                 else:
                     cands[key] = c
-            time.sleep(0.4)
+            time.sleep(6.2)
 
 
 def discover_gecko_top(cands):
@@ -518,7 +525,7 @@ def discover_gecko_top(cands):
                     else:
                         cands[key] = c
 
-                time.sleep(0.35)
+                time.sleep(6.2)
 
 
 
@@ -600,53 +607,76 @@ def gmgn_unwrap_rank(data):
     return x if isinstance(x, list) else []
 
 
+def run_gmgn_cli(args, timeout=45):
+    """Run the official GMGN CLI and parse --raw JSON without exposing secrets."""
+    if not GMGN_KEY:
+        return None
+    cmd = [GMGN_CLI] + list(args) + ["--raw"]
+    env = os.environ.copy()
+    # The CLI reads GMGN_API_KEY from the environment; never put it in argv/logs.
+    env["GMGN_API_KEY"] = GMGN_KEY
+    try:
+        cp = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
+    except FileNotFoundError:
+        print("[warn] GMGN CLI not installed")
+        return None
+    except Exception as e:
+        print(f"[warn] GMGN CLI failed to start -> {e}")
+        return None
+    if cp.returncode != 0:
+        msg = (cp.stderr or cp.stdout or "").strip().replace(GMGN_KEY, "***")
+        print(f"[warn] GMGN CLI exit={cp.returncode}: {msg[:300]}")
+        return None
+    raw = (cp.stdout or "").strip()
+    if not raw:
+        return None
+    # --raw is documented as one-line JSON; tolerate harmless preamble lines.
+    for line in reversed(raw.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            return json.loads(line)
+        except Exception:
+            continue
+    print("[warn] GMGN CLI returned non-JSON output")
+    return None
+
+
+def _gmgn_rows(data):
+    x = unwrap_data(data)
+    if isinstance(x, dict):
+        for k in ("list", "tokens", "data", "result"):
+            if isinstance(x.get(k), list):
+                return x[k]
+    return x if isinstance(x, list) else []
+
+
 def discover_gmgn(cands):
-    # Public read-only ranking endpoint documented by community tooling. If GMGN
-    # blocks GitHub Actions, the scanner simply continues with other sources.
-    for tf in ("1m", "5m", "1h"):
-        url = f"{GMGN_BASE}/defi/quotation/v1/rank/sol/swaps/{tf}"
-        params = {"orderby": "smartmoney" if tf != "1m" else "swaps", "direction": "desc"}
-        if GMGN_KEY:
-            params["apikey"] = GMGN_KEY
-        data = http_json(url, params=params, headers={"accept": "application/json", "user-agent": "Mozilla/5.0"}, timeout=18, retries=1)
-        rows = gmgn_unwrap_rank(data)
-        for row in rows[:120]:
-            addr = str(row.get("address") or row.get("token_address") or "").lower()
-            if not addr:
-                continue
-            key = f"solana:{addr}"
-            c = blank_candidate("solana", addr, str(row.get("symbol") or addr[:6]))
-            c["name"] = row.get("name") or c["symbol"]
-            c["price"] = fnum(row.get("price"))
-            c["liq"] = fnum(row.get("liquidity"))
-            c["fdv"] = fnum(row.get("marketcap")) or fnum(row.get("market_cap"))
-            c["holders"] = inum(row.get("holder_count"))
-            c["smart_count"] = inum(row.get("smartmoney")) or inum(row.get("smart_money_count")) or inum(row.get("smart_degen_count"))
-            c["kol_count"] = inum(row.get("renowned_count"))
-            c["buys1h"] = inum(row.get("buys")) if tf == "1h" else c["buys1h"]
-            c["sells1h"] = inum(row.get("sells")) if tf == "1h" else c["sells1h"]
-            c["txns1h"] = c["buys1h"] + c["sells1h"]
-            c["vol1h"] = fnum(row.get("volume")) if tf == "1h" else c["vol1h"]
-            # GMGN's 1m/5m rows are retained as acceleration anchors.
-            if tf == "1m":
-                c["vol1m"] = fnum(row.get("volume"))
-                c["chg_m1"] = fnum(row.get("change1m"))
-                c["buys1m"] = inum(row.get("buys"))
-                c["sells1m"] = inum(row.get("sells"))
-            elif tf == "5m":
-                c["vol5m"] = fnum(row.get("volume"))
-                c["chg_m5"] = fnum(row.get("change5m"))
-                c["buys5m"] = inum(row.get("buys"))
-                c["sells5m"] = inum(row.get("sells"))
-            c["chg_h1"] = fnum(row.get("change1h")) if tf == "1h" else c["chg_h1"]
-            c["age_h"] = age_hours(row.get("open_timestamp") or row.get("openTimestamp"))
-            c["gmgn"] = True
-            c["src"] = "gmgn_" + tf
-            if key in cands:
-                merge_candidate(cands[key], c)
-            else:
-                cands[key] = c
-        time.sleep(0.5)
+    # Use the official GMGN CLI instead of old website endpoints.
+    data = run_gmgn_cli(["market", "trending", "--chain", "sol", "--interval", "1h", "--order-by", "smart_degen_count", "--limit", "80"], timeout=60)
+    rows = _gmgn_rows(data)
+    for row in rows:
+        addr = str(row.get("address") or row.get("token_address") or "").lower()
+        if not addr:
+            continue
+        key = f"solana:{addr}"
+        c = blank_candidate("solana", addr, str(row.get("symbol") or addr[:6]))
+        c["name"] = row.get("name") or c["symbol"]
+        c["price"] = fnum(row.get("price"))
+        c["liq"] = fnum(row.get("liquidity"))
+        c["fdv"] = fnum(row.get("market_cap")) or fnum(row.get("marketcap"))
+        c["holders"] = inum(row.get("holder_count"))
+        c["smart_count"] = inum(row.get("smart_degen_count")) or inum(row.get("smartmoney"))
+        c["kol_count"] = inum(row.get("renowned_wallets")) or inum(row.get("renowned_count"))
+        c["age_h"] = age_hours(row.get("open_timestamp") or row.get("creation_timestamp"))
+        c["gmgn"] = True
+        c["src"] = "gmgn_cli"
+        if key in cands:
+            merge_candidate(cands[key], c)
+        else:
+            cands[key] = c
+    print(f"GMGN CLI discovery: {len(rows)} rows")
 
 
 def discover():
@@ -670,113 +700,132 @@ def discover():
 # ---------------------------------------------------------------------------
 # GMGN / ON-CHAIN ENRICHMENT
 # ---------------------------------------------------------------------------
-def gmgn_token_top_buyers(token):
-    if not token:
-        return []
-    url = f"{GMGN_BASE}/defi/quotation/v1/tokens/top_buyers/sol/{token}"
-    data = http_json(url, headers={"accept": "application/json", "user-agent": "Mozilla/5.0"}, timeout=15, retries=1)
-    x = unwrap_data(data)
-    if isinstance(x, dict):
-        for key in ("list", "buyers", "rank", "data"):
-            if isinstance(x.get(key), list):
-                return x[key]
-    return x if isinstance(x, list) else []
-
-
-def normalize_buyer(row):
-    if not isinstance(row, dict):
-        return None
-    addr = row.get("address") or row.get("wallet") or row.get("maker") or row.get("account_address")
-    if not addr:
-        return None
-    tags = row.get("maker_token_tags") or row.get("wallet_tags") or row.get("tags") or row.get("tag") or []
-    if isinstance(tags, str):
-        tags = [tags]
-    tags = {str(x).lower() for x in tags}
-    usd = fnum(row.get("buy_volume_cur")) or fnum(row.get("buy_volume")) or fnum(row.get("buy_usd")) or fnum(row.get("amount_usd")) or fnum(row.get("usd_value"))
-    return {
-        "address": str(addr),
-        "usd": usd,
-        "tags": tags,
-        "fresh": bool(tags & {"fresh_wallet", "fresh"}),
-        "bundler": bool(tags & {"bundler", "bundle"}),
-        "sniper": bool(tags & {"sniper"}),
-        "smart": bool(tags & {"smart_degen", "smartmoney", "smart_money"}),
-        "kol": bool(tags & {"renowned", "kol"}),
-        "rat": bool(tags & {"rat_trader", "rat"}),
-    }
-
-
-def wallet_stats(wallet):
-    if not wallet:
-        return None
-    # Public endpoint observed in GMGN-compatible tooling. It may be unavailable
-    # from Actions; failure is intentionally non-fatal.
-    url = f"{GMGN_BASE}/api/v1/wallet_stat/sol/{wallet}/7d"
-    data = http_json(url, headers={"accept": "application/json", "user-agent": "Mozilla/5.0"}, timeout=12, retries=1)
-    x = unwrap_data(data)
-    return x if isinstance(x, dict) else None
-
-
 def enrich_gmgn(cands):
-    sol = [c for c in cands.values() if c["net"] == "solana" and (c["gmgn"] or c["liq"] >= MIN_LIQ)]
-    # Only deeply enrich the strongest candidates to protect rate limits.
-    sol.sort(key=lambda c: (c["smart_count"], c["vol1h"], c["liq"]), reverse=True)
-    for c in sol[:GMGN_ENRICH_LIMIT]:
-        buyers = gmgn_token_top_buyers(c["token"])
-        if not buyers:
+    if not GMGN_KEY:
+        print("GMGN: missing API key")
+        return
+
+    # One official smart-money feed gives us the strongest early signal: several
+    # tagged smart wallets buying the same token within a short window.
+    smart_data = run_gmgn_cli(["track", "smartmoney", "--chain", "sol", "--side", "buy", "--limit", str(GMGN_SMART_LIMIT)], timeout=60)
+    smart_rows = _gmgn_rows(smart_data)
+    kol_data = run_gmgn_cli(["track", "kol", "--chain", "sol", "--side", "buy", "--limit", str(GMGN_KOL_LIMIT)], timeout=60)
+    kol_rows = _gmgn_rows(kol_data)
+
+    by_token = {}
+    for row in smart_rows:
+        addr = str(row.get("base_address") or "").lower()
+        if not addr:
             continue
-        parsed = [normalize_buyer(x) for x in buyers]
-        parsed = [x for x in parsed if x]
-        if not parsed:
+        key = f"solana:{addr}"
+        by_token.setdefault(key, []).append(row)
+
+    by_kol = {}
+    for row in kol_rows:
+        addr = str(row.get("base_address") or "").lower()
+        if addr:
+            by_kol.setdefault(f"solana:{addr}", []).append(row)
+
+    for key, rows in by_token.items():
+        c = cands.get(key)
+        if not c:
             continue
-        c["cluster_wallets"] = len({x["address"] for x in parsed if x["smart"]})
-        c["smart_count"] = max(c["smart_count"], sum(x["smart"] for x in parsed))
-        c["kol_count"] = max(c["kol_count"], sum(x["kol"] for x in parsed))
-        c["fresh_count"] = sum(x["fresh"] for x in parsed)
-        c["bundler_count"] = sum(x["bundler"] for x in parsed)
-        c["sniper_count"] = sum(x["sniper"] for x in parsed)
-        c["rat_count"] = sum(x["rat"] for x in parsed)
-        smart = [x for x in parsed if x["smart"]]
-        c["smart_buy_usd"] = sum(x["usd"] for x in smart)
-        c["cluster_buy_usd"] = sum(x["usd"] for x in smart)
-        amounts = sorted([x["usd"] for x in parsed if x["usd"] > 0], reverse=True)
-        c["big_buys"] = sum(1 for x in amounts if x >= 500)
-        c["avg_big_buy"] = statistics.mean(amounts[:10]) if amounts else 0.0
-        c["max_big_buy"] = amounts[0] if amounts else 0.0
-        # Sample wallet quality only for a few distinct smart wallets.
-        quality_scores = []
-        for w in list(dict.fromkeys(x["address"] for x in smart))[:GMGN_WALLET_LIMIT]:
-            ws = wallet_stats(w)
-            if not ws:
-                continue
-            win = fnum(ws.get("winrate"))
-            if win <= 1:
-                win *= 100
-            pnl = fnum(ws.get("pnl")) or fnum(ws.get("total_profit"))
-            realized = fnum(ws.get("realized_profit"))
-            q = clamp(win * 0.65 + (50 + math.tanh(pnl / 10000.0) * 50) * 0.35)
-            if realized < -100:
-                q -= 10
-            quality_scores.append(clamp(q))
-        if quality_scores:
-            c["wallet_quality"] = statistics.mean(quality_scores)
+        wallets = {str(r.get("maker") or ((r.get("maker_info") or {}).get("address")) or "") for r in rows}
+        wallets.discard("")
+        c["smart_count"] = max(c["smart_count"], len(wallets))
+        c["smart_buy_usd"] = max(c["smart_buy_usd"], sum(fnum(r.get("amount_usd")) for r in rows))
+        amounts = [fnum(r.get("amount_usd")) for r in rows if fnum(r.get("amount_usd")) > 0]
+        c["big_buys"] = max(c["big_buys"], sum(1 for x in amounts if x >= 500))
+        if amounts:
+            c["avg_big_buy"] = max(c["avg_big_buy"], statistics.mean(amounts))
+            c["max_big_buy"] = max(c["max_big_buy"], max(amounts))
+        # Cluster: >=2 distinct smart wallets buying within 30 minutes.
+        ts_rows = [(fnum(r.get("timestamp")), str(r.get("maker") or "")) for r in rows if fnum(r.get("timestamp"))]
+        best = 0
+        best_usd = 0.0
+        for ts, _ in ts_rows:
+            group = [(w, t) for t, w in ts_rows if abs(t - ts) <= 1800 and w]
+            uniq = {w for w, _ in group}
+            usd = sum(fnum(r.get("amount_usd")) for r in rows if fnum(r.get("timestamp")) and abs(fnum(r.get("timestamp")) - ts) <= 1800)
+            if len(uniq) > best:
+                best = len(uniq); best_usd = usd
+        c["cluster_wallets"] = max(c["cluster_wallets"], best)
+        c["cluster_buy_usd"] = max(c["cluster_buy_usd"], best_usd)
+        c["fresh_count"] += sum(1 for r in rows if "fresh" in {str(x).lower() for x in ((r.get("maker_info") or {}).get("tags") or [])})
+        c["sniper_count"] += sum(1 for r in rows if "sniper" in {str(x).lower() for x in ((r.get("maker_info") or {}).get("tags") or [])})
+        c["bundler_count"] += sum(1 for r in rows if "bund" in " ".join(str(x).lower() for x in ((r.get("maker_info") or {}).get("tags") or [])))
         c["gmgn"] = True
+
+    for key, rows in by_kol.items():
+        c = cands.get(key)
+        if not c:
+            continue
+        c["kol_count"] = max(c["kol_count"], len({str(r.get("maker") or "") for r in rows if r.get("maker")}))
+        c["gmgn"] = True
+
+    # Token-level official GMGN queries for the strongest candidates. This also
+    # gives a second independent security source and current holder count.
+    targets = sorted(cands.values(), key=lambda c: (c["smart_count"], c["vol1h"], c["liq"]), reverse=True)[:GMGN_ENRICH_LIMIT]
+    for c in targets:
+        info = run_gmgn_cli(["token", "info", "--chain", "sol", "--address", c["token"]], timeout=35)
+        info = unwrap_data(info)
+        if isinstance(info, dict):
+            c["gmgn"] = True
+            c["holders"] = max(c["holders"], inum(info.get("holder_count")))
+            c["liq"] = max(c["liq"], fnum(info.get("liquidity")))
+            c["fdv"] = max(c["fdv"], fnum(info.get("market_cap")) or fnum(info.get("marketcap")))
+            wstat = info.get("wallet_tags_stat") or {}
+            c["smart_count"] = max(c["smart_count"], inum(wstat.get("smart_wallets")))
+            c["kol_count"] = max(c["kol_count"], inum(wstat.get("renowned_wallets")))
+            stat = info.get("stat") or {}
+            top10 = fnum(stat.get("top_10_holder_rate"))
+            if top10 > 1:
+                top10 /= 100.0
+            if 0 < top10 <= 1:
+                c["top10_rate"] = max(c["top10_rate"], top10)
+
+        sec = run_gmgn_cli(["token", "security", "--chain", "sol", "--address", c["token"]], timeout=35)
+        sec = unwrap_data(sec)
+        if isinstance(sec, dict) and sec:
+            c["gmgn_security"] = True
+            c["security_complete"] = True
+            # Preserve raw-safe fields only; never print credentials.
+            honeypot = str(sec.get("is_honeypot", "")).lower()
+            if honeypot in {"yes", "true", "1"}:
+                c["honeypot"] = True; c["sec_drop"] = True; c["security_notes"].append("GMGN honeypot")
+            for fld, label in (("mintable", "mintable"), ("freezable", "freezable"), ("owner_change_balance", "owner_change_balance"), ("transfer_pausable", "transfer_pausable")):
+                if str(sec.get(fld, "")).lower() in {"yes", "true", "1"}:
+                    c["security_notes"].append("GMGN " + label)
+                    if fld in {"owner_change_balance"}:
+                        c["sec_drop"] = True
+            rr = fnum(sec.get("rug_ratio"))
+            if rr > 1: rr /= 100.0
+            if rr > 0: c["rug_risk"] = max(c["rug_risk"], rr * 100 if rr <= 1 else rr)
+            top10 = fnum(sec.get("top_10_holder_rate"))
+            if top10 > 1: top10 /= 100.0
+            if 0 < top10 <= 1: c["top10_rate"] = max(c["top10_rate"], top10)
         time.sleep(0.25)
+
+    print(f"GMGN CLI enrichment: smart_rows={len(smart_rows)} kol_rows={len(kol_rows)} token_checks={len(targets)}")
 
 
 # ---------------------------------------------------------------------------
 # SECURITY: RUGCHECK + GOPLUS
 # ---------------------------------------------------------------------------
 def enrich_rugcheck(cands):
+    if not RUGCHECK_API_KEY:
+        print("RugCheck: no API key configured; using GMGN/GoPlus security instead")
+        return
+    rh = {"X-API-KEY": RUGCHECK_API_KEY}
     for c in sorted([x for x in cands.values() if x["net"] == "solana"], key=lambda z: (z["smart_count"], z["vol1h"], z["liq"]), reverse=True)[:RUGCHECK_LIMIT]:
-        data = http_json(f"{RUGCHECK_BASE}/tokens/{c['token']}/report/summary", timeout=18, retries=1)
+        data = http_json(f"{RUGCHECK_BASE}/tokens/{c['token']}/report/summary", headers=rh, timeout=18, retries=1)
         if not data:
             # fallback endpoint
-            data = http_json(f"{RUGCHECK_BASE}/tokens/{c['token']}/report", timeout=18, retries=1)
+            data = http_json(f"{RUGCHECK_BASE}/tokens/{c['token']}/report", headers=rh, timeout=18, retries=1)
         if not data:
             continue
         c["rugcheck"] = True
+        c["security_complete"] = True
         score = fnum(deep_find(data, {"score"}, None), 50)
         # RugCheck uses a lower-is-better risk score in many reports.
         c["rug_risk"] = clamp(score, 0, 100)
@@ -897,6 +946,7 @@ def enrich_goplus(cands):
         if not isinstance(row, dict):
             continue
         c["goplus"] = True
+        c["security_complete"] = True
 
         # EVM + Solana common critical flags.
         honeypot = _truthy_flag(row.get("is_honeypot")) or _truthy_flag(row.get("cannot_sell_all"))
@@ -1277,7 +1327,10 @@ def main():
     enrich_rugcheck(alive)
     enrich_goplus(alive)
     alive = {k: c for k, c in alive.items() if not c["sec_drop"] and not c["honeypot"]}
-    print("after safety:", len(alive))
+    # Never treat missing security evidence as a pass.
+    insecure_unknown = sum(1 for c in alive.values() if not c.get("security_complete"))
+    alive = {k: c for k, c in alive.items() if c.get("security_complete")}
+    print(f"after safety: {len(alive)} | security-unavailable dropped: {insecure_unknown}")
 
     # Score + state snapshot.
     for key, c in alive.items():
