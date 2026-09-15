@@ -15,7 +15,7 @@ concurrency:
 jobs:
   hunt:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -28,19 +28,29 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Check configuration
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install GMGN CLI
+        run: npm install -g gmgn-cli@latest
+
+      - name: Configuration check
         env:
+          GMGN_API_KEY: ${{ secrets.GMGN_API_KEY }}
           GOPLUS_APP_KEY: ${{ secrets.GOPLUS_APP_KEY }}
           GOPLUS_APP_SECRET: ${{ secrets.GOPLUS_APP_SECRET }}
-          GMGN_API_KEY: ${{ secrets.GMGN_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          test -n "$GMGN_API_KEY" && echo "GMGN API Key: configured" || echo "GMGN API Key: MISSING"
           test -n "$GOPLUS_APP_KEY" && echo "GoPlus APP Key: configured" || echo "GoPlus APP Key: MISSING"
           test -n "$GOPLUS_APP_SECRET" && echo "GoPlus APP Secret: configured" || echo "GoPlus APP Secret: MISSING"
-          test -n "$GMGN_API_KEY" && echo "GMGN API Key: configured" || echo "GMGN API Key: MISSING"
           test -n "$TELEGRAM_BOT_TOKEN" && echo "Telegram Bot Token: configured" || echo "Telegram Bot Token: MISSING"
           test -n "$TELEGRAM_CHAT_ID" && echo "Telegram Chat ID: configured" || echo "Telegram Chat ID: MISSING"
+          gmgn-cli --version
 
       - name: Hunt
         env:
@@ -52,10 +62,13 @@ jobs:
           NETWORKS: solana
           PRIMARY_NETWORK: solana
           MAX_AGE_H: 720
-          GECKO_TOP_PAGES: 10
-          GMGN_ENRICH_LIMIT: 10
+          GECKO_TOP_PAGES: 3
+          GMGN_ENRICH_LIMIT: 14
           GMGN_WALLET_LIMIT: 2
-          RUGCHECK_LIMIT: 15
+          GMGN_SMART_LIMIT: 200
+          GMGN_KOL_LIMIT: 100
+          RUGCHECK_LIMIT: 14
+          MAX_ALERTS_PER_RUN: 4
         run: python hunter.py
 
       - name: Persist state
