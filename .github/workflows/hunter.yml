@@ -28,14 +28,31 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Check configuration
+        env:
+          GOPLUS_APP_KEY: ${{ secrets.GOPLUS_APP_KEY }}
+          GOPLUS_APP_SECRET: ${{ secrets.GOPLUS_APP_SECRET }}
+          GMGN_API_KEY: ${{ secrets.GMGN_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          test -n "$GOPLUS_APP_KEY" && echo "GoPlus APP Key: configured" || echo "GoPlus APP Key: MISSING"
+          test -n "$GOPLUS_APP_SECRET" && echo "GoPlus APP Secret: configured" || echo "GoPlus APP Secret: MISSING"
+          test -n "$GMGN_API_KEY" && echo "GMGN API Key: configured" || echo "GMGN API Key: MISSING"
+          test -n "$TELEGRAM_BOT_TOKEN" && echo "Telegram Bot Token: configured" || echo "Telegram Bot Token: MISSING"
+          test -n "$TELEGRAM_CHAT_ID" && echo "Telegram Chat ID: configured" || echo "Telegram Chat ID: MISSING"
+
       - name: Hunt
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GOPLUS_API_KEY: ${{ secrets.GOPLUS_API_KEY }}
+          GOPLUS_APP_KEY: ${{ secrets.GOPLUS_APP_KEY }}
+          GOPLUS_APP_SECRET: ${{ secrets.GOPLUS_APP_SECRET }}
           GMGN_API_KEY: ${{ secrets.GMGN_API_KEY }}
           NETWORKS: solana
           PRIMARY_NETWORK: solana
+          MAX_AGE_H: 720
+          GECKO_TOP_PAGES: 10
           GMGN_ENRICH_LIMIT: 10
           GMGN_WALLET_LIMIT: 2
           RUGCHECK_LIMIT: 15
@@ -45,9 +62,7 @@ jobs:
         run: |
           git config user.name "hunter-bot"
           git config user.email "actions@users.noreply.github.com"
-
           git add state/
-
           if git diff --cached --quiet; then
             echo "No state changes to commit."
           else
